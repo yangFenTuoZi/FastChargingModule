@@ -1,0 +1,98 @@
+import org.apache.tools.ant.filters.ReplaceTokens
+
+plugins {
+    alias(libs.plugins.android.library)
+}
+
+var moduleName = "FastCharging"
+var moduleBaseId = "fastCharging"
+var author = "yangFenTuoZi@Github (佬开朗@Coolapk)"
+
+var verCode = project.properties.versionCode.toInteger()
+var verName = project.properties.versionName
+
+android {
+    namespace 'yangFenTuoZi.fastCharging'
+    compileSdk 35
+
+    defaultConfig {
+        minSdk 28
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    buildFeatures {
+        androidResources false
+        buildConfig false
+        prefab = true
+        prefabPublishing = true
+    }
+
+    externalNativeBuild {
+        cmake {
+            path "src/main/cpp/CMakeLists.txt"
+        }
+    }
+
+    prefab {
+        register("fastCharging")
+    }
+}
+
+tasks.register('zipAll', DefaultTask) {
+}
+
+android.libraryVariants.configureEach { variant ->
+    def variantCapped = variant.name.capitalize()
+    def variantLowered = variant.name.toLowerCase()
+    def buildTypeCapped = variant.buildType.name.capitalize()
+    def buildTypeLowered = variant.buildType.name.toLowerCase()
+
+    def magiskDir = new File(layout.buildDirectory.get().asFile, "outputs/$variantLowered")
+    if (!magiskDir.exists()) {
+        magiskDir.mkdirs()
+    }
+
+    def moduleId = "$moduleBaseId"
+    def zipFileName = "$moduleName-v$verName-$verCode-${buildTypeLowered}.zip"
+
+    tasks.register("prepareMagiskFiles$variantCapped", Sync) {
+        dependsOn "assemble$variantCapped", ":fastCharging:merge${buildTypeCapped}NativeLibs"
+        into magiskDir
+        from "${rootProject.projectDir}/README.md"
+        from("$projectDir/module") {
+            exclude "module.prop"
+        }
+        from("$projectDir/module") {
+            include "module.prop"
+            expand([
+                    "moduleId"   : moduleId,
+                    "moduleName" : moduleName,
+                    "versionName": "v$verName",
+                    "versionCode": verCode,
+                    "author"     : author,
+                    "description": "快充模块，允许用户自定义电流数据及需要修改的文件，本模块只有在检测到充电后才会写入电流数据，可以设置延迟及等待时间，给电池留出喘气时间，防止断充"
+            ])
+            filter { line -> line.replaceAll('\r\n|\r|\n', '\n') }
+        }
+        into("bin") {
+            from(project.layout.buildDirectory.dir("intermediates/cmake/${buildTypeLowered}/obj").get().asFile) {
+                include "**/fastCharging"
+            }
+        }
+    }
+
+    tasks.register("zip$variantCapped", Zip) {
+        dependsOn "prepareMagiskFiles$variantCapped"
+        archiveFileName = zipFileName
+        destinationDirectory = file("$projectDir/release")
+        from magiskDir
+    }
+
+    zipAll.dependsOn "zip$variantCapped"
+}

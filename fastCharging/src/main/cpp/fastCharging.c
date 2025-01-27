@@ -13,21 +13,32 @@
 
 #define LOG_TAG "FastChargingModule"
 
-int current_max = -1;
-int interval = 1000;
-int charging_wait_time = 5000;
-int reload_config_interval = 60;
-int enable_log = 1;
-int log_max_size = 1024;
-
 char log_file_path[PATH_MAX];
 char ini_file_path[PATH_MAX];
 
-char chargingData[1024][2][1024];
-int dataCount = 0;
+struct settings_data {
+    int interval;
+    int charging_wait_time;
+    int reload_config_interval;
+    int enable_log;
+    int log_max_size;
+    int retry_times;
+} settingsData;
+
+struct charging_data {
+    int retry[1024];
+    char chargingData[1024][2][1024];
+    int dataCount;
+} chargingData;
+
+struct battery_info {
+    int capacity;
+    float temperature;
+    int isCharging;
+} batteryInfo;
 
 void log_message(int level, const char *format, ...) {
-    if (!enable_log) return;
+    if (!settingsData.enable_log) return;
     char type;
     switch (level) {
         case ANDROID_LOG_DEBUG:
@@ -46,7 +57,7 @@ void log_message(int level, const char *format, ...) {
     va_start(args, format);
 
     struct stat st;
-    if (stat(log_file_path, &st) == 0 && st.st_size >= (log_max_size * 1024)) {
+    if (stat(log_file_path, &st) == 0 && st.st_size >= (settingsData.log_max_size * 1024)) {
         char backup_file_path[PATH_MAX];
         snprintf(backup_file_path, sizeof(backup_file_path), "%s.bak", log_file_path);
         rename(log_file_path, backup_file_path);
@@ -79,97 +90,126 @@ void log_message(int level, const char *format, ...) {
 #define LOGW(...) log_message(ANDROID_LOG_WARN, __VA_ARGS__)
 #define LOGE(...) log_message(ANDROID_LOG_ERROR, __VA_ARGS__)
 
-void write_file(const char *_Nonnull path, const char *_Nonnull text) {
-
-    struct stat buffer;
-    if (stat(path, &buffer) != 0) {
-        return;
-    }
-
-    if (access(path, W_OK) != 0) {
-        LOGW("文件%s没有写入权限，尝试添加写入权限", path);
-        if (chmod(path, S_IWUSR) != 0) {
-            LOGE("添加写入权限错误：%s", strerror(errno));
-            return;
-        }
-    }
-
-    FILE *fp = fopen(path, "w");
-    if (fp == NULL)
-        return;
-    fputs(text, fp);
-    fclose(fp);
-}
-
 void write_fast_charging_data() {
-    char str[1024];
+    for (int i = 0; i < chargingData.dataCount; i++) {
+        if (chargingData.retry[i] < 1) continue;
+        if (strcmp("{{SHELL}}", chargingData.chargingData[i][0]) == 0) {
 
-    for (int i = 0; i < dataCount; i++) {
-        if (strcmp(chargingData[i][1], "{current_max}") == 0) {
-            sprintf(str, "%d\n", current_max);
-            write_file(chargingData[i][0], str);
+            char command[2048];
+            snprintf(command, sizeof(command), "%s 2>&1", chargingData.chargingData[i][1]);
+
+            FILE *fp = popen(command, "r");
+            if (fp == NULL) {
+                LOGE("执行命令失败: %s", strerror(errno));
+                chargingData.retry[i]--;
+                continue;
+            }
+
+            char buffer[1024];
+            while (fgets(buffer, sizeof(buffer), fp) != NULL) {
+                LOGI("命令输出: %s", buffer);
+            }
+
+            int status = pclose(fp);
+            if (status == -1) {
+                LOGE("关闭命令失败: %s", strerror(errno));
+                chargingData.retry[i]--;
+            } else if (WEXITSTATUS(status) != 0) {
+                LOGE("命令%s执行失败，返回值: %d", chargingData.chargingData[i][1], WEXITSTATUS(status));
+                chargingData.retry[i]--;
+            }
         } else {
-            sprintf(str, "%s\n", chargingData[i][1]);
-            write_file(chargingData[i][0], str);
+            struct stat buffer;
+            if (stat(chargingData.chargingData[i][0], &buffer) != 0) {
+                LOGW("文件%s不存在", chargingData.chargingData[i][0]);
+                chargingData.retry[i]--;
+                return;
+            }
+
+            FILE *fp = fopen(chargingData.chargingData[i][0], "w");
+            if (fp == NULL) {
+                LOGE("打开文件%s错误：%s", chargingData.chargingData[i][0], strerror(errno));
+                chargingData.retry[i]--;
+                return;
+            }
+            fputs(chargingData.chargingData[i][1], fp);
+            fputs("\n", fp);
+            fclose(fp);
         }
     }
 }
 
-int isCharging() {
-    FILE *fp;
-    char status[20];
-
-    fp = fopen("/sys/class/power_supply/battery/status", "r");
+char *readFile(const char *path) {
+    static char buf[1024];
+    FILE *fp = fopen(path, "r");
     if (fp == NULL) {
-        LOGE("打开文件错误：%s", strerror(errno));
-        return -1;
+        LOGE("打开文件 %s 错误：%s", path, strerror(errno));
+        return NULL;
     }
 
-    if (fgets(status, sizeof(status), fp) != NULL) {
-        status[strcspn(status, "\n")] = 0;
-
-        if (strcmp(status, "Charging") == 0) {
-            fclose(fp);
-            return 1;
+    if (fgets(buf, sizeof(buf), fp) == NULL) {
+        if (ferror(fp)) {
+            LOGE("读取文件 %s 错误", path);
         }
+        fclose(fp);
+        return NULL;
     }
 
+    buf[strcspn(buf, "\n")] = 0;
     fclose(fp);
-    return 0;
+    return buf;
+}
+
+void refreshBatteryInfo() {
+    // capacity
+    batteryInfo.capacity = atoi(readFile("/sys/class/power_supply/battery/capacity"));
+    // temperature
+    batteryInfo.temperature = (float) (atoi(readFile("/sys/class/power_supply/battery/temp")) /
+                                       10.0f);
+    // isCharging
+    batteryInfo.isCharging =
+            strcmp(readFile("/sys/class/power_supply/battery/status"), "Charging") == 0;
+
+    char buf[1024];
+    snprintf(buf, sizeof(buf), "%d", batteryInfo.capacity);
+    setenv("BATTERY_CAPACITY", buf, 1);
+    snprintf(buf, sizeof(buf), "%.1f", batteryInfo.temperature);
+    setenv("BATTERY_TEMP", buf, 1);
 }
 
 void load_config() {
     // 读取配置文件
-    current_max = ini_getl("setting", "current_max", -1, ini_file_path);
-    interval = ini_getl("setting", "interval", 1000, ini_file_path);
-    reload_config_interval = ini_getl("setting", "reload_config_interval", 1000, ini_file_path);
-    charging_wait_time = ini_getl("setting", "charging_wait_time", 5000, ini_file_path);
-    enable_log = ini_getl("setting", "enable_log", 1, ini_file_path);
-    log_max_size = ini_getl("setting", "log_max_size", 1024, ini_file_path);
+    settingsData.interval = ini_getl("setting", "interval", 1000, ini_file_path);
+    settingsData.reload_config_interval = ini_getl("setting", "reload_config_interval", 60, ini_file_path);
+    settingsData.charging_wait_time = ini_getl("setting", "charging_wait_time", 5000, ini_file_path);
+    settingsData.enable_log = ini_getl("setting", "enable_log", 1, ini_file_path);
+    settingsData.log_max_size = ini_getl("setting", "log_max_size", 8, ini_file_path);
+    settingsData.retry_times = ini_getl("setting", "retry_times", 5, ini_file_path);
 
-    if (current_max == -1) {
-        LOGE("配置文件必须填写current_max值");
-        exit(1);
-    }
-
-    interval *= 1000;
-    charging_wait_time *= 1000;
+    settingsData.interval *= 1000;
+    settingsData.charging_wait_time *= 1000;
 
     char section[] = "chargingData";
     char key[PATH_MAX];
     char value[1024];
-    dataCount = 0;
-    while (ini_getkey(section, dataCount, key, sizeof(key), ini_file_path) > 0) {
+    chargingData.dataCount = 0;
+    while (ini_getkey(section, chargingData.dataCount, key, sizeof(key), ini_file_path) > 0) {
         ini_gets(section, key, "", value, sizeof(value), ini_file_path);
-        strcpy(chargingData[dataCount][0], key);
-        strcpy(chargingData[dataCount][1], value);
-        dataCount++;
+        if (strcmp(key, "{{SHELL}}") != 0 && chmod(key, S_IWUSR | S_IWGRP | S_IWOTH |
+                       S_IRUSR | S_IRGRP | S_IROTH |
+                       S_IXUSR | S_IXGRP | S_IXOTH) != 0) {
+            LOGW("文件%s设置777权限错误：%s", key, strerror(errno));
+        }
+        strcpy(chargingData.chargingData[chargingData.dataCount][0], key);
+        strcpy(chargingData.chargingData[chargingData.dataCount][1], value);
+        chargingData.retry[chargingData.dataCount] = settingsData.retry_times;
+        chargingData.dataCount++;
     }
 }
 
 void *reload_config_thread(void *arg) {
     while (1) {
-        usleep(reload_config_interval * 1000 * 1000);
+        sleep(settingsData.reload_config_interval);
         load_config();
     }
     return NULL;
@@ -191,28 +231,27 @@ int main() {
     }
 
     // 开始监听
-    int charging;
     LOGI("开始监听充电状态");
     while (1) {
-        charging = isCharging();
-        if (charging == -1) exit(1);
-        if (charging) {
+        refreshBatteryInfo();
+        if (batteryInfo.isCharging == -1) exit(1);
+        if (batteryInfo.isCharging) {
             LOGI("开始充电");
             // 充电开始后等待一定时间再循环写入电流数据
-            usleep(charging_wait_time);
+            usleep(settingsData.charging_wait_time);
             while (1) {
-                charging = isCharging();
-                if (charging == -1) return 1;
+                refreshBatteryInfo();
+                if (batteryInfo.isCharging == -1) exit(1);
                 // 充电结束，退出此循环，在父循环继续监听
-                if (!charging) {
+                if (!batteryInfo.isCharging) {
                     LOGI("充电结束");
                     break;
                 }
                 // 写入电流数据
                 write_fast_charging_data();
-                usleep(interval);
+                usleep(settingsData.interval);
             }
         }
-        usleep(interval);
+        usleep(settingsData.interval);
     }
 }
